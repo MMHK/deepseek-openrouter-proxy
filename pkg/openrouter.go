@@ -1,61 +1,21 @@
 package pkg
 
 import (
+	"bufio"
 	"bytes"
-	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/openai/openai-go"
-	"github.com/openai/openai-go/option"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/http/httputil"
+	"net/url"
 	"os"
+	"path/filepath"
+	"strconv"
 	"strings"
 )
 
-type ISSEDecoder interface {
-	GetBytes() []byte
-}
-
-type StreamChunk struct {
-	Chunk  string
-}
-
-func (this *StreamChunk) GetBytes() []byte {
-	return []byte(this.Chunk)
-}
-
-type IStreamableResponse interface {
-	IsStream() bool
-	GetResponse() io.Reader
-	GetEvents() <-chan ISSEDecoder
-}
-
-type StdRequestParams struct {
-	Stream bool   `json:"stream,omitempty"`
-	Model  string `json:"model,required"`
-}
-
-type MessageCompleteResponse struct {
-	stream   bool
-	Response io.Reader
-	Events   <-chan ISSEDecoder
-}
-
-func (this *MessageCompleteResponse) IsStream() bool {
-	return this.stream
-}
-
-func (this *MessageCompleteResponse) GetResponse() io.Reader {
-	return this.Response
-}
-
-func (this *MessageCompleteResponse) GetEvents() <-chan ISSEDecoder {
-	return this.Events
-}
 
 type OpenRouterConf struct {
 	BaseURL            string            `json:"base_url,omitempty"`
@@ -88,23 +48,25 @@ func LoadOpenRouterConfFromEnv() (*OpenRouterConf) {
 }
 
 type OpenRouter struct {
-	*openai.Client
 	*OpenRouterConf
+	proxy  *httputil.ReverseProxy
 }
 
 func NewOpenRouter(conf *OpenRouterConf) (*OpenRouter) {
-	client := openai.NewClient(option.WithAPIKey(conf.APIKey),
-	option.WithBaseURL(conf.BaseURL))
+	targetURl, err := url.Parse(conf.BaseURL)
+	if err != nil {
+		Log.Error(err)
+	}
 
 	return &OpenRouter{
-		Client: client,
 		OpenRouterConf: conf,
+		proxy:  httputil.NewSingleHostReverseProxy(targetURl),
 	}
 }
 
 func (this *OpenRouter) GetModelMappings(source string) (string, error) {
 	if len(this.ModelMappings) > 0 {
-		if target, ok := this.ModelMappings[source]; ok {
+		if target, ok := this.OpenRouterConf.ModelMappings[source]; ok {
 			return target, nil
 		}
 	}
@@ -112,25 +74,6 @@ func (this *OpenRouter) GetModelMappings(source string) (string, error) {
 	return source, errors.New(fmt.Sprintf("model %s not found in model mappings", source))
 }
 
-func (this *OpenRouter) GetParamsFromRequestBody(reader io.Reader) (params *StdRequestParams, RequestOptions []option.RequestOption, err error) {
-	params = &StdRequestParams{}
-	RequestOptions = []option.RequestOption{}
-
-	var buf bytes.Buffer
-	teeReader := io.TeeReader(reader, &buf)
-
-	decoder := json.NewDecoder(teeReader)
-
-	err = decoder.Decode(params)
-	if err != nil {
-		Log.Error(err)
-		return nil, RequestOptions, err
-	}
-
-	RequestOptions = append(RequestOptions, option.WithRequestBody("application/json", &buf))
-
-	return params, RequestOptions, nil
-}
 
 // 自定义的 RoundTripper 用于记录请求和响应
 type loggingRoundTripper struct {
@@ -153,92 +96,245 @@ func (l loggingRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	Log.Infof("Response:\n%s", string(respDump))
 
 	// 重要：我们需要重新创建响应体，因为 DumpResponse 会消耗它
-	bodyBytes, _ := ioutil.ReadAll(resp.Body)
+	bodyBytes, _ := io.ReadAll(resp.Body)
 	resp.Body.Close()
-	resp.Body = ioutil.NopCloser(bytes.NewBuffer(bodyBytes))
+	resp.Body = io.NopCloser(bytes.NewBuffer(bodyBytes))
 
 	return resp, nil
 }
 
-func (this *OpenRouter) MessageCompletionRaw(params *StdRequestParams, RequestOptions []option.RequestOption) (IStreamableResponse, error) {
-	ctx := context.Background()
+type responseWriter struct {
+	http.ResponseWriter
+	buf *bytes.Buffer
+	status int
+	header http.Header
+}
 
-	param := openai.ChatCompletionNewParams{
-		Model: openai.F(params.Model),
+func (rw *responseWriter) Write(p []byte) (int, error) {
+	if rw.status == 0 {
+		rw.status = http.StatusOK
+	}
+	return rw.buf.Write(p)
+}
+
+func (rw *responseWriter) Header() http.Header {
+	return rw.header
+}
+
+func (rw *responseWriter) WriteHeader(statusCode int) {
+	rw.status = statusCode
+}
+
+func (rw *responseWriter) Flush() {
+	rw.ResponseWriter.(http.Flusher).Flush()
+}
+
+func (this *OpenRouter) HandleProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Accept") == "text/event-stream" {
+
+		req := &http.Request{
+			Method: r.Method,
+			URL:    r.URL,
+			Proto:  r.Proto,
+			Header: r.Header.Clone(),
+			Body:   r.Body,
+		}
+		// 複製原始請求的 headers
+		this.modifyRequest(req)
+
+		var (
+			resp *http.Response
+			err  error
+		)
+		// 發送請求到目標服務器
+		if this.Debug {
+			debugClient := &http.Client{
+				Transport: &loggingRoundTripper{
+					wrapped: http.DefaultTransport,
+				},
+			}
+			resp, err = debugClient.Do(req);
+		} else {
+			resp, err = http.DefaultClient.Do(req)
+		}
+		if err != nil {
+			Log.Error(err)
+			http.Error(w, err.Error(), http.StatusBadGateway)
+			return
+		}
+		defer resp.Body.Close()
+
+		if err := this.handleSSEStream(w, resp); err != nil {
+			Log.Error(err)
+		}
+		return
 	}
 
-	model, err := this.GetModelMappings(param.Model.String())
+	this.proxy.ModifyResponse = this.modifyResponse
+	this.proxy.Director = this.modifyRequest
+
+	customWriter := &responseWriter{
+		ResponseWriter: w,
+		buf:            new(bytes.Buffer),
+		header:         make(http.Header),
+	}
+
+	if this.Debug {
+		this.proxy.Transport = &loggingRoundTripper{
+			wrapped: http.DefaultTransport,
+		}
+	}
+
+	this.proxy.ServeHTTP(customWriter, r)
+
+	// 寫入修改後的響應
+	w.WriteHeader(customWriter.status)
+	headers := customWriter.Header()
+	for k, v := range headers {
+		w.Header()[k] = v
+	}
+	_, err := w.Write(customWriter.buf.Bytes())
 	if err != nil {
 		Log.Error(err)
-		return nil, err
+	}
+}
+
+func (this *OpenRouter) modifyRequest(req *http.Request) {
+	Log.Infof("modifyRequest: %s %s", req.Method, req.URL.String())
+
+	targetURL, err := url.Parse(this.BaseURL)
+	if err != nil {
+		Log.Error(err)
+		return
+	}
+	req.URL.Host = targetURL.Host
+	req.URL.Scheme = targetURL.Scheme
+	req.URL.Path = filepath.ToSlash(filepath.Join(targetURL.Path, req.URL.Path))
+	req.Host = targetURL.Host
+
+	if this.OpenRouterConf.RankingsTitle != "" {
+		req.Header.Set("X-Title", this.RankingsTitle)
 	}
 
-	param.Model = openai.F(model)
+	if this.OpenRouterConf.RankingsURL != "" {
+		req.Header.Set("HTTP-Referer", this.RankingsURL)
+	}
 
+	if this.OpenRouterConf.APIKey != "" {
+		req.Header.Set("Authorization", fmt.Sprintf("Bearer %s", this.APIKey))
+	}
 
-
-	RequestOptions = append(RequestOptions,
-		option.WithHeader("X-Title", this.RankingsTitle),
-		option.WithHeader("HTTP-Referer", this.RankingsURL),
-		option.WithJSONSet("model", model))
-
-	if this.OpenRouterConf.Debug {
-		// 创建自定义的 http.Client
-		customClient := &http.Client{
-			Transport: &loggingRoundTripper{
-				wrapped: http.DefaultTransport,
-			},
+	contentType := req.Header.Get("Content-Type")
+	Log.Infof("Content-Type: %s", contentType)
+	if strings.Contains(contentType, "json") {
+		var body map[string]interface{}
+		decoder := json.NewDecoder(req.Body)
+		err := decoder.Decode(&body)
+		if err != nil {
+			Log.Error(err)
+			return
+		}
+		//Log.Infof("req body: %+v", body)
+		targetModel := ""
+		if srcModel, ok := body["model"]; ok {
+			Log.Infof("src model: %s", srcModel)
+			if model, ok := srcModel.(string); ok {
+				targetModel, err = this.GetModelMappings(model)
+				if err != nil {
+					Log.Error(err)
+					return
+				}
+				Log.Infof("mapped model: %s", targetModel)
+			}
 		}
 
-		RequestOptions = append(RequestOptions, option.WithHTTPClient(customClient))
+		if this.EnableOutputReason {
+			body["include_reasoning"] = true
+		}
+
+		if targetModel != "" {
+			body["model"] = targetModel
+		}
+
+		newBody, err := json.Marshal(body)
+		if err != nil {
+			Log.Error(err)
+			return
+		}
+
+		req.Body = io.NopCloser(bytes.NewBuffer(newBody))
+		req.ContentLength = int64(len(newBody))
+		req.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
+	}
+}
+
+func (this *OpenRouter) modifyResponse(res *http.Response) error {
+	// 檢查內容類型
+	contentType := res.Header.Get("Content-Type")
+
+	if strings.Contains(contentType, "json") {
+		// 處理 JSON
+		return this.handleJSON(res)
 	}
 
-	if this.OpenRouterConf.EnableOutputReason {
-		RequestOptions = append(RequestOptions, option.WithJSONSet("include_reasoning", true))
+	// 其他類型不做修改
+	return nil
+}
+
+func (this *OpenRouter) handleSSEStream(w http.ResponseWriter, res *http.Response) error {
+	// 設置 SSE 相關的 headers
+	for k, v := range res.Header {
+		w.Header()[k] = v
+	}
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("Cache-Control", "no-cache")
+	w.Header().Set("Connection", "keep-alive")
+
+	flusher, ok := w.(http.Flusher)
+	if !ok {
+		return fmt.Errorf("streaming unsupported")
 	}
 
-	if params.Stream {
-		streamResp := this.Client.Chat.Completions.NewStreaming(ctx, param, RequestOptions...)
+	Log.Infof("handleSSEStream");
 
-		eventQueue := make(chan ISSEDecoder, 10)
+	scanner := bufio.NewScanner(res.Body)
+	for scanner.Scan() {
+		line := scanner.Text()
 
-		go func() {
-			defer close(eventQueue)
+		// 這裡可以修改 SSE 數據
+		if this.EnableOutputReason && strings.HasPrefix(line, "data:") {
+			line = strings.ReplaceAll(line, `"reasoning"`, `"reasoning_content"`)
+		}
 
-			for streamResp.Next() {
-				chunk := streamResp.Current()
-				eventQueue <- &StreamChunk{
-					Chunk: strings.ReplaceAll(chunk.JSON.RawJSON(), `"reasoning"`, `"reasoning_content"`),
-				}
-			}
-		}()
-
-		return &MessageCompleteResponse{
-			stream:   true,
-			Events:   eventQueue,
-		}, nil
+		// 寫入修改後的行並立即刷新
+		fmt.Fprintf(w, "%s\n", line)
+		//Log.Infof("SSE: %s\n", line)
+		flusher.Flush()
 	}
 
-	completion, err := this.Client.Chat.Completions.New(ctx, param, RequestOptions...)
+	if err := scanner.Err(); err != nil {
+		Log.Error(err)
+		return err
+	}
+
+	return nil
+}
+
+func (this *OpenRouter) handleJSON(resp *http.Response) error {
+	body, err := io.ReadAll(resp.Body)
 	if err != nil {
 		Log.Error(err)
-		return nil, err
+		return err
 	}
 
-	if this.OpenRouterConf.EnableOutputReason {
-		output := completion.JSON.RawJSON();
-		output = strings.ReplaceAll(output, `"reasoning"`, `"reasoning_content"`)
+	newBody := bytes.ReplaceAll(body, []byte(`"reasoning"`), []byte(`"reasoning_content"`))
 
-		return &MessageCompleteResponse{
-			stream:   false,
-			Response: strings.NewReader(output),
-		}, nil
-	}
+	// 替換原始 body
+	resp.Body = io.NopCloser(bytes.NewBuffer(newBody))
+	resp.ContentLength = int64(len(newBody))
+	resp.Header.Set("Content-Length", strconv.Itoa(len(newBody)))
 
-	return &MessageCompleteResponse{
-		stream:   false,
-		Response: strings.NewReader(completion.JSON.RawJSON()),
-	}, nil
+	return nil
 }
 
 
