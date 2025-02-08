@@ -1,0 +1,27 @@
+version: '3'
+services:
+  deepseek-openrouter-proxy:
+    image: "mmhk/deepseek-openrouter-proxy"
+    restart: always
+    environment:
+      API_KEY: ${API_KEY}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY}
+      OPENROUTER_MODEL_MAPPINGS: '{"deepseek-reasoner":"deepseek/deepseek-r1","deepseek-chat":"deepseek/deepseek-chat"}'
+    ports:
+      - "8809:8809"
+  chatgpt-next:
+    image: "mmhk/chatgpt-next-web"
+    restart: always
+    environment:
+      DEFAULT_MODEL: "gpt-4o@azure"
+      HIDE_USER_API_KEY: 1
+      DISABLE_FAST_LINK: 1
+      GA_ID: XXX
+      AZURE_URL: "https://mm-jp-gpt.openai.azure.com/openai"
+      AZURE_API_VERSION: "2024-05-01-preview"
+      AZURE_API_KEY: ${AZURE_API_KEY}
+      DEEPSEEK_API_KEY: ${API_KEY}
+      DEEPSEEK_URL: http://deepseek-openrouter-proxy:8809/api/deepseek
+      CUSTOM_MODELS: "-all,+gpt-4o@azure=gpt-4o,+deepseek-reasoner=DeepSeek R1,+deepseek-chat=DeepSeek V3"
+    ports:
+      - "4001:3000"

@@ -129,18 +129,41 @@ func (rw *responseWriter) Flush() {
 	rw.ResponseWriter.(http.Flusher).Flush()
 }
 
-func (this *OpenRouter) HandleProxy(w http.ResponseWriter, r *http.Request) {
-	if r.Header.Get("Accept") == "text/event-stream" {
-
-		req := &http.Request{
-			Method: r.Method,
-			URL:    r.URL,
-			Proto:  r.Proto,
-			Header: r.Header.Clone(),
-			Body:   r.Body,
+func (this *OpenRouter) IsAcceptStream(req *http.Request) (*http.Request, bool) {
+	contentType := req.Header.Get("Content-Type")
+	if strings.Contains(contentType, "json") {
+		var buf bytes.Buffer
+		reader := io.TeeReader(req.Body, &buf)
+		type streamWrapper struct {
+			Stream bool `json:"stream"`
 		}
+		decoder := json.NewDecoder(reader)
+		isStream := new(streamWrapper)
+		err := decoder.Decode(isStream)
+		cloneReq := &http.Request{
+			Method: req.Method,
+			URL:    req.URL,
+			Proto:  req.Proto,
+			Header: req.Header.Clone(),
+			Body:   io.NopCloser(bytes.NewBuffer(buf.Bytes())),
+		}
+		if err != nil {
+			Log.Error(err)
+			return cloneReq, false
+		}
+
+		return cloneReq, isStream.Stream
+	}
+
+	return req, false
+}
+
+func (this *OpenRouter) HandleProxy(w http.ResponseWriter, r *http.Request) {
+	cloneReq, isStream := this.IsAcceptStream(r)
+
+	if isStream {
 		// 複製原始請求的 headers
-		this.modifyRequest(req)
+		this.modifyRequest(cloneReq)
 
 		var (
 			resp *http.Response
@@ -148,15 +171,11 @@ func (this *OpenRouter) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		)
 		// 發送請求到目標服務器
 		if this.Debug {
-			debugClient := &http.Client{
-				Transport: &loggingRoundTripper{
-					wrapped: http.DefaultTransport,
-				},
-			}
-			resp, err = debugClient.Do(req);
-		} else {
-			resp, err = http.DefaultClient.Do(req)
+			reqDump, _ := httputil.DumpRequestOut(cloneReq, true)
+			Log.Infof("Request:\n%s", string(reqDump))
 		}
+
+		resp, err = http.DefaultClient.Do(cloneReq)
 		if err != nil {
 			Log.Error(err)
 			http.Error(w, err.Error(), http.StatusBadGateway)
@@ -185,7 +204,7 @@ func (this *OpenRouter) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	this.proxy.ServeHTTP(customWriter, r)
+	this.proxy.ServeHTTP(customWriter, cloneReq)
 
 	// 寫入修改後的響應
 	w.WriteHeader(customWriter.status)
@@ -225,7 +244,7 @@ func (this *OpenRouter) modifyRequest(req *http.Request) {
 	}
 
 	contentType := req.Header.Get("Content-Type")
-	Log.Infof("Content-Type: %s", contentType)
+	//Log.Infof("Content-Type: %s", contentType)
 	if strings.Contains(contentType, "json") {
 		var body map[string]interface{}
 		decoder := json.NewDecoder(req.Body)
@@ -237,14 +256,14 @@ func (this *OpenRouter) modifyRequest(req *http.Request) {
 		//Log.Infof("req body: %+v", body)
 		targetModel := ""
 		if srcModel, ok := body["model"]; ok {
-			Log.Infof("src model: %s", srcModel)
+			//Log.Infof("src model: %s", srcModel)
 			if model, ok := srcModel.(string); ok {
 				targetModel, err = this.GetModelMappings(model)
 				if err != nil {
 					Log.Error(err)
 					return
 				}
-				Log.Infof("mapped model: %s", targetModel)
+				//Log.Infof("mapped model: %s", targetModel)
 			}
 		}
 
@@ -295,7 +314,10 @@ func (this *OpenRouter) handleSSEStream(w http.ResponseWriter, res *http.Respons
 		return fmt.Errorf("streaming unsupported")
 	}
 
-	Log.Infof("handleSSEStream");
+	if this.Debug {
+		Log.Infof("handleSSEStream: %s", res.Header.Get("Content-Type"))
+	}
+
 
 	scanner := bufio.NewScanner(res.Body)
 	for scanner.Scan() {
@@ -308,7 +330,9 @@ func (this *OpenRouter) handleSSEStream(w http.ResponseWriter, res *http.Respons
 
 		// 寫入修改後的行並立即刷新
 		fmt.Fprintf(w, "%s\n", line)
-		//Log.Infof("SSE: %s\n", line)
+		if this.Debug {
+			Log.Infof("SSE: %s\n", line)
+		}
 		flusher.Flush()
 	}
 

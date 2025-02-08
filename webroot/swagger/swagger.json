@@ -1,0 +1,164 @@
+{
+  "openapi": "3.0.0",
+  "info": {
+    "title": "DeepSeek Chat Completion API",
+    "description": "API for creating chat completions using DeepSeek models.",
+    "version": "1.0.0"
+  },
+  "servers": [
+    {
+      "url": "https://api.deepseek.com/api",
+      "description": "DeepSeek API base URL"
+    }
+  ],
+  "tags": [
+    {
+      "name": "Chat Completion",
+      "description": "Endpoints for creating chat completions"
+    }
+  ],
+  "paths": {
+    "/deepseek/v1/chat/completions": {
+      "post": {
+        "tags": [
+          "DeepSeek"
+        ],
+        "summary": "Create a chat completion",
+        "description": "Creates a chat completion using the specified model and input messages.",
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "properties": {
+                  "model": {
+                    "type": "string",
+                    "description": "The model to use for chat completion. (e.g., 'deepseek-chat', 'deepseek-reasoner').",
+                    "example": "deepseek-reasoner"
+                  },
+                  "messages": {
+                    "type": "array",
+                    "description": "A list of messages comprising the conversation so far.",
+                    "items": {
+                      "type": "object",
+                      "properties": {
+                        "role": {
+                          "type": "string",
+                          "description": "The role of the message (e.g., 'user', 'assistant').",
+                          "example": "user"
+                        },
+                        "content": {
+                          "type": "string",
+                          "description": "The content of the message.",
+                          "example": "Hello, how can I assist you today?"
+                        }
+                      }
+                    }
+                  },
+                  "temperature": {
+                    "type": "number",
+                    "format": "float",
+                    "description": "Sampling temperature to control randomness (0.0 to 1.0).",
+                    "example": 0.7
+                  },
+                  "max_tokens": {
+                    "type": "integer",
+                    "description": "The maximum number of tokens to generate.",
+                    "example": 150
+                  }
+                },
+                "required": [
+                  "model",
+                  "messages"
+                ]
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "Successful response with the chat completion result.",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "id": {
+                      "type": "string",
+                      "description": "The unique identifier for the chat completion.",
+                      "example": "cmpl-1234567890"
+                    },
+                    "object": {
+                      "type": "string",
+                      "description": "The type of the object (e.g., 'chat.completion').",
+                      "example": "chat.completion"
+                    },
+                    "created": {
+                      "type": "integer",
+                      "description": "The timestamp when the completion was created.",
+                      "example": 1698765432
+                    },
+                    "model": {
+                      "type": "string",
+                      "description": "The model used for the completion.",
+                      "example": "deepseek-coder"
+                    },
+                    "choices": {
+                      "type": "array",
+                      "description": "The list of chat completion choices.",
+                      "items": {
+                        "type": "object",
+                        "properties": {
+                          "index": {
+                            "type": "integer",
+                            "description": "The index of the choice.",
+                            "example": 0
+                          },
+                          "message": {
+                            "type": "object",
+                            "properties": {
+                              "role": {
+                                "type": "string",
+                                "description": "The role of the message (e.g., 'assistant').",
+                                "example": "assistant"
+                              },
+                              "content": {
+                                "type": "string",
+                                "description": "The generated message content.",
+                                "example": "Sure, I can help with that!"
+                              },
+                              "reasoning_content": {
+                                "type": "string",
+                                "description": "(Only for `deepseek-reasoner`) The detailed reasoning process for the response.",
+                                "example": "The reasoning process involves adding 2 and 2 to compute the sum."
+                              }
+                            }
+                          },
+                          "finish_reason": {
+                            "type": "string",
+                            "description": "The reason why the generation finished (e.g., 'stop').",
+                            "example": "stop"
+                          }
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Bad request. The request is invalid or missing required parameters."
+          },
+          "401": {
+            "description": "Unauthorized. Invalid or missing API key."
+          },
+          "500": {
+            "description": "Internal server error. Something went wrong on the server side."
+          }
+        }
+      }
+    }
+  }
+}

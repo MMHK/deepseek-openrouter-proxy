@@ -3,8 +3,8 @@ package pkg
 import (
 	"encoding/json"
 	"fmt"
-	"net/http"
 	"github.com/gorilla/mux"
+	"net/http"
 	"strings"
 )
 
@@ -104,11 +104,12 @@ func (this *HTTPService) Start() {
 	apiRouter.Use(this.APIKeyMiddleware)
 
 	conf := LoadOpenRouterConfFromEnv()
-	openrouter := NewOpenRouter(conf)
+	conf.Debug = true
+	openRouter := NewOpenRouter(conf)
 
-	apiRouter.PathPrefix("/deepseek").
-		Handler(http.StripPrefix("/deepseek",
-			http.HandlerFunc(openrouter.HandleProxy)))
+	deepseekRouter := apiRouter.PathPrefix("/deepseek").Subrouter()
+	deepseekRouter.PathPrefix("/").
+		Handler(http.StripPrefix("/api/deepseek", http.HandlerFunc(openRouter.HandleProxy)))
 
 	rHandler.HandleFunc("/", this.RedirectSwagger)
 	rHandler.PathPrefix("/").Handler(http.StripPrefix("/",

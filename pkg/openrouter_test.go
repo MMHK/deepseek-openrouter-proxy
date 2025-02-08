@@ -10,7 +10,7 @@ import (
 func GetOpenRouterClient() *OpenRouter {
 	conf := LoadOpenRouterConfFromEnv()
 
-	conf.Debug = false
+	conf.Debug = true
 
 	return NewOpenRouter(conf)
 }
