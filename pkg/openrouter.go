@@ -21,10 +21,19 @@ type OpenRouterConf struct {
 	BaseURL            string            `json:"base_url,omitempty"`
 	APIKey             string            `json:"api_key,omitempty"`
 	ModelMappings      map[string]string `json:"model_mappings"`
-	EnableOutputReason bool              `json:"enable_reason,omitempty"`
+	EnableOutputReason bool              `json:"output_reason,omitempty"`
+	EnableReasoning    bool              `json:"enable_reason,omitempty"`
+	ReasoningEffect    string            `json:"reasoning_effect,omitempty"`
+	ReasoningMaxTokens int               `json:"reasoning_max_tokens,omitempty"`
 	RankingsTitle      string            `json:"rankings_title,omitempty"`
 	RankingsURL        string            `json:"rankings_url,omitempty"`
 	Debug              bool              `json:"-"`
+}
+
+type OpenRouterReasoningConfig struct {
+	Effort    string `json:"effect,omitempty"`
+	MaxTokens int    `json:"max_tokens,omitempty"`
+	Exclude   bool   `json:"exclude"`
 }
 
 func LoadOpenRouterConfFromEnv() (*OpenRouterConf) {
@@ -35,6 +44,14 @@ func LoadOpenRouterConfFromEnv() (*OpenRouterConf) {
 
 	conf.RankingsTitle = os.Getenv("OPENROUTER_RANKINGS_TITLE")
 	conf.RankingsURL = os.Getenv("OPENROUTER_RANKINGS_URL")
+	conf.EnableReasoning = os.Getenv("OPENROUTER_ENABLE_REASONING") == "true"
+	conf.ReasoningEffect = os.Getenv("OPENROUTER_REASONING_EFFECT")
+	conf.Debug = os.Getenv("OPENROUTER_DEBUG") == "true"
+
+	conf.ReasoningMaxTokens = 0
+	if len(os.Getenv("OPENROUTER_REASONING_MAX_TOKENS")) > 0 {
+		conf.ReasoningMaxTokens, _ = strconv.Atoi(os.Getenv("OPENROUTER_REASONING_MAX_TOKENS"))
+	}
 
 	modelMappingsJSON := os.Getenv("OPENROUTER_MODEL_MAPPINGS")
 	if len(modelMappingsJSON) > 0 {
@@ -43,6 +60,7 @@ func LoadOpenRouterConfFromEnv() (*OpenRouterConf) {
 			Log.Error(err)
 		}
 	}
+
 
 	return conf
 }
@@ -62,6 +80,16 @@ func NewOpenRouter(conf *OpenRouterConf) (*OpenRouter) {
 		OpenRouterConf: conf,
 		proxy:  httputil.NewSingleHostReverseProxy(targetURl),
 	}
+}
+
+func (this *OpenRouter) GetReasoningEffect() string {
+	if this.OpenRouterConf.ReasoningEffect == "medium" {
+		return "medium"
+	}
+	if this.OpenRouterConf.ReasoningEffect == "high" {
+		return "high"
+	}
+	return "low"
 }
 
 func (this *OpenRouter) GetModelMappings(source string) (string, error) {
@@ -204,14 +232,15 @@ func (this *OpenRouter) HandleProxy(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	this.proxy.ServeHTTP(customWriter, cloneReq)
+	r.Body = cloneReq.Body
+	this.proxy.ServeHTTP(customWriter, r)
 
 	// 寫入修改後的響應
-	w.WriteHeader(customWriter.status)
 	headers := customWriter.Header()
 	for k, v := range headers {
 		w.Header()[k] = v
 	}
+	w.WriteHeader(customWriter.status)
 	_, err := w.Write(customWriter.buf.Bytes())
 	if err != nil {
 		Log.Error(err)
@@ -219,8 +248,6 @@ func (this *OpenRouter) HandleProxy(w http.ResponseWriter, r *http.Request) {
 }
 
 func (this *OpenRouter) modifyRequest(req *http.Request) {
-	Log.Infof("modifyRequest: %s %s", req.Method, req.URL.String())
-
 	targetURL, err := url.Parse(this.BaseURL)
 	if err != nil {
 		Log.Error(err)
@@ -244,9 +271,10 @@ func (this *OpenRouter) modifyRequest(req *http.Request) {
 	}
 
 	contentType := req.Header.Get("Content-Type")
+
 	//Log.Infof("Content-Type: %s", contentType)
 	if strings.Contains(contentType, "json") {
-		var body map[string]interface{}
+		body := map[string]interface{}{}
 		decoder := json.NewDecoder(req.Body)
 		err := decoder.Decode(&body)
 		if err != nil {
@@ -267,8 +295,22 @@ func (this *OpenRouter) modifyRequest(req *http.Request) {
 			}
 		}
 
-		if this.EnableOutputReason {
-			body["include_reasoning"] = true
+
+		if _, ok := body["reasoning"]; !ok && this.EnableReasoning {
+			reasoningConf := &OpenRouterReasoningConfig{
+				Effort:    this.GetReasoningEffect(),
+			}
+			if this.EnableOutputReason {
+				reasoningConf.Exclude = false
+			} else {
+				reasoningConf.Exclude = true
+			}
+
+			if this.ReasoningMaxTokens > 0 {
+				reasoningConf.MaxTokens = this.ReasoningMaxTokens
+			}
+
+			body["reasoning"] = reasoningConf
 		}
 
 		if targetModel != "" {
@@ -314,8 +356,25 @@ func (this *OpenRouter) handleSSEStream(w http.ResponseWriter, res *http.Respons
 		return fmt.Errorf("streaming unsupported")
 	}
 
+	responseContentType := res.Header.Get("Content-Type")
 	if this.Debug {
-		Log.Infof("handleSSEStream: %s", res.Header.Get("Content-Type"))
+		Log.Infof("handleSSEStream Response Content-Type: %s", responseContentType)
+	}
+	if strings.Contains(responseContentType, "json") {
+
+		if this.Debug {
+			// 记录响应
+			respDump, _ := httputil.DumpResponse(res, true)
+			Log.Infof("Response:\n%s", string(respDump))
+		}
+
+		w.Header().Set("Content-Type", responseContentType)
+		w.WriteHeader(res.StatusCode)
+		_, err := io.Copy(w, res.Body)
+		if err != nil {
+			Log.Error(err)
+		}
+		return err
 	}
 
 

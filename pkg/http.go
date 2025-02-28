@@ -104,7 +104,6 @@ func (this *HTTPService) Start() {
 	apiRouter.Use(this.APIKeyMiddleware)
 
 	conf := LoadOpenRouterConfFromEnv()
-	conf.Debug = true
 	openRouter := NewOpenRouter(conf)
 
 	deepseekRouter := apiRouter.PathPrefix("/deepseek").Subrouter()

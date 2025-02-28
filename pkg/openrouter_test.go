@@ -19,15 +19,12 @@ func TestOpenRouter_HandleProxyJSON(t *testing.T) {
 	openrouter := GetOpenRouterClient()
 
 
+	body := `{"model":"deepseek-reasoner","reasoning":{"exclude":true},"stream":false,"messages":[{"role":"user","content":"明天的前天，是昨天的后天吗？"}]}`
 	// 創建一個測試請求
-	req := httptest.NewRequest("POST", "https://api.deepseek.com/chat/completions", bytes.NewBufferString(`{
-	"model": "deepseek-reasoner",
-	"stream": false,
-	"messages": [{"role": "user", "content": "明天的前天，是昨天的后天吗？"}]
-}`))
-	req.Header.Set("Accept", "application/json")
+	req := httptest.NewRequest("POST", "https://api.deepseek.com/chat/completions", bytes.NewBufferString(body))
+	//req.Header.Set("Accept", "application/json")
 	req.Header.Set("Content-Type", "application/json")
-
+	req.ContentLength = int64(len(body))
 
 	// 創建一個響應記錄器
 	w := httptest.NewRecorder()
@@ -54,7 +51,8 @@ func TestOpenRouter_HandleProxyStream(t *testing.T) {
 
 	// 創建一個測試請求
 	req := httptest.NewRequest("POST", "https://api.deepseek.com/chat/completions", bytes.NewBufferString(`{
-	"model": "deepseek-reasoner",
+	"model": "claude-3.7-sonnet",
+	"reasoning": { "exclude":false, "max_tokens": 2000 },
 	"stream": true,
 	"messages": [{"role": "user", "content": "明天的前天，是昨天的后天吗？"}]
 }`))
